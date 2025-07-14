@@ -1,0 +1,19 @@
+
+(ocamllex lexer)
+
+(ocamlyacc parser)
+
+
+(executable
+ (name toycc)
+ (public_name toycc)
+
+ (modules
+  ast
+  ir
+  lexer      
+  parser     
+  semantic
+  ir_gen
+  codegen
+  toycc))
