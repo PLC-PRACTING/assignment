@@ -5,8 +5,8 @@
 
 
 (executable
- (name toycc)
- (public_name toycc)
+ (name main)
+ (public_name main)
 
  (modules
   ast
@@ -16,4 +16,4 @@
   semantic
   ir_gen
   codegen
-  toycc))
+  main))
