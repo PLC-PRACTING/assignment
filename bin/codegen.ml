@@ -257,71 +257,66 @@ and translate_instructions env (instructions: Ir.instruction list) =
 
 (* 分析一个函数的所有指令, 计算栈帧大小并为所有变量分配栈空间 *)
 let allocate_stack_frame (env: env) (func: ir_func) =
+  let saved_regs_size = 8 in (* 为 ra 和 s0 固定预留 8 字节 *)
+  
   let allocate_var var_name =
     if not (Hashtbl.mem env.stack_map var_name) then (
       env.stack_size <- env.stack_size + 4;
-      let offset = -env.stack_size in
+      (* 变量的偏移量从 -12 开始，在预留的 8 字节之下 *)
+      let offset = -(env.stack_size + saved_regs_size) in
       Hashtbl.add env.stack_map var_name offset
     )
   in
   
-  (* 1. === 优先为所有函数参数分配栈空间 === *)
   List.iter allocate_var func.params;
-  
-  (* 2. 再为函数体内的局部变量和临时变量分配空间 *)
   List.iter (fun instr ->
     match instr with
     | Ir.Assign (v, _) | Ir.BinOp (v, _, _, _) | Ir.UnOp (v, _, _) -> allocate_var v
     | Ir.Call (Some v, _, _) -> allocate_var v
-    | Ir.Arg (_, v) -> allocate_var v (* 确保 Arg 的目标也被分配 *)
+    | Ir.Arg (_, v) -> allocate_var v
     | _ -> ()
   ) func.instructions
 
-(* 翻译一个函数 *)
 let translate_function (ir_func: ir_func) : string =
   let env = create_env () in
   env.func_name <- ir_func.name;
 
-  (* 步骤 1: 预计算栈帧大小 *)
-  (* 1a. 计算变量和临时变量所需的空间 *)
+  (* 步骤 1: 计算变量所需的空间 *)
   allocate_stack_frame env ir_func;
   
-  (* 1b. 为保存 ra 和 s0 寄存器额外增加 8 字节 *)
-  env.stack_size <- env.stack_size + 8;
+  (* 步骤 2: 计算最终的、对齐的总栈帧大小 *)
+  let total_stack_size =
+    let size = env.stack_size + 8 in (* 变量空间 + 保存 ra/s0 的 8 字节 *)
+    (size + 15) / 16 * 16 (* 向上舍入到 16 的倍数 *)
+  in
   
-  (* 1c. 将总大小向上舍入到 16 的倍数，以满足 ABI 的 16 字节对齐要求 *)
-  env.stack_size <- (env.stack_size + 15) / 16 * 16;
-  
-  (* 步骤 2: 生成函数头部和序言 (Prologue) *)
+  (* 步骤 3: 生成函数头部和序言 (Prologue) *)
   emit env ("\n.globl " ^ ir_func.name);
   emit env ".text";
   emit env (ir_func.name ^ ":");
 
-  (* 使用最终计算出的 stack_size 来分配栈帧 *)
-  emit env (Printf.sprintf "  addi sp, sp, %d" (-env.stack_size));
+  emit env (Printf.sprintf "  addi sp, sp, %d" (-total_stack_size));
   
-  (* 在已分配的空间内，使用相对于新 sp 的正偏移量来保存寄存器 *)
-  emit env (Printf.sprintf "  sw ra, %d(sp)" (env.stack_size - 4));
-  emit env (Printf.sprintf "  sw s0, %d(sp)" (env.stack_size - 8));
+  (* 关键修改：使用相对于总栈帧大小的、固定的正偏移量来保存 ra 和 s0 *)
+  emit env (Printf.sprintf "  sw ra, %d(sp)" (total_stack_size - 4));
+  emit env (Printf.sprintf "  sw s0, %d(sp)" (total_stack_size - 8));
   
-  (* 设置新的帧指针 s0，使其指向栈帧的底部 *)
-  emit env (Printf.sprintf "  addi s0, sp, %d" env.stack_size);
+  (* 设置新的帧指针 s0 *)
+  emit env (Printf.sprintf "  addi s0, sp, %d" total_stack_size);
   
-  (* 步骤 3: 调用主翻译循环 *)
+  (* 步骤 4: 调用主翻译循环 *)
   translate_instructions env ir_func.instructions;
 
-  (* 步骤 4: 生成函数尾声 (Epilogue) *)
+  (* 步骤 5: 生成函数尾声 (Epilogue) *)
   emit env (".L_ret_" ^ ir_func.name ^ ":");
   
-  (* 从正确的位置恢复寄存器 *)
-  emit env (Printf.sprintf "  lw ra, %d(sp)" (env.stack_size - 4));
-  emit env (Printf.sprintf "  lw s0, %d(sp)" (env.stack_size - 8));
+  (* 从同样固定的位置恢复寄存器 *)
+  emit env (Printf.sprintf "  lw ra, %d(sp)" (total_stack_size - 4));
+  emit env (Printf.sprintf "  lw s0, %d(sp)" (total_stack_size - 8));
   
-  (* 释放栈帧 *)
-  emit env (Printf.sprintf "  addi sp, sp, %d" env.stack_size);
+  emit env (Printf.sprintf "  addi sp, sp, %d" total_stack_size);
   emit env "  ret";
   
-  (* 将生成的代码列表拼接成字符串 *)
   String.concat "\n" (List.rev env.asm_code)
 
 (* 主入口函数: 翻译整个 IR 程序 *)
