@@ -3,14 +3,24 @@
 (* 命令行参数的简单解析 *)
 let input_file = ref ""
 let output_file = ref ""
+let optimize_enabled = ref false (* 用于 -opt 标志的布尔引用 *)
 
-let usage_msg = "toycc <源文件.tc> [-o <输出文件.s>]"
+let speclist = Arg.align [
+  ("-o", Arg.Set_string output_file, " <file>  指定输出文件名 (默认为 stdout)");
+  ("-opt", Arg.Set optimize_enabled, "         开启优化 ");
+]
 
-let speclist =
-  [("-o", Arg.Set_string output_file, "指定输出文件名")]
+(* --- 定义用法信息和匿名参数处理函数 --- *)
+let usage_msg = "用法: toycc [源文件] [-o <输出文件>] [-opt]\n如果省略 [源文件]，则从标准输入 stdin 读取。"
 
+(* 解析匿名参数（即没有 -flag 的参数，通常是输入文件名） *)
 let anon_fun filename =
-  input_file := filename
+  (* 只接受第一个匿名参数作为输入文件 *)
+  if !input_file = "" then
+    input_file := filename
+  else
+    (* 如果已经有输入文件了，再来一个就是错误 *)
+    raise (Arg.Bad ("只能指定一个输入源文件，多余的参数: '" ^ filename ^ "'"))
 
 (* -------------------------------------------------------------------------- *)
 (* 辅助函数: 用于打印错误信息的位置                                               *)
@@ -23,76 +33,89 @@ let string_of_position (pos: Lexing.position) : string =
 (* 编译器主函数                                                               *)
 (* -------------------------------------------------------------------------- *)
 let compile () =
-  (* 1. 打开输入文件 *)
-  let in_channel = open_in !input_file in
+  (* --- 决定输入通道 --- *)
+  let in_channel, close_in_channel =
+    if !input_file = "" then
+      (stdin, fun () -> ()) (* 从 stdin 读取，关闭通道是无操作 *)
+    else
+       try
+        (* 1. 只打开一次文件 *)
+        let channel = open_in !input_file in
+        (* 2. 创建一个闭包，它捕获了这个已经打开的 channel *)
+        (channel, fun () -> close_in_noerr channel)
+      with Sys_error msg ->
+        Printf.eprintf "错误: 无法打开输入文件 '%s': %s\n" !input_file msg;
+        exit 1
+  in
+  
+  (* --- 决定输出通道 --- *)
+  let out_channel, close_out_channel =
+    if !output_file = "" then
+      (stdout, fun () -> ()) (* 向 stdout 写入，关闭是无操作 *)
+    else
+      try
+        (* 1. 只打开一次文件 *)
+        let channel = open_out !output_file in
+        (* 2. 创建一个闭包，它捕获了这个已经打开的 channel *)
+        (channel, fun () -> close_out_noerr channel)
+      with Sys_error msg ->
+        Printf.eprintf "错误: 无法创建输出文件 '%s': %s\n" !output_file msg;
+        exit 1
+  in
+
   let lexbuf = Lexing.from_channel in_channel in
 
   try
-    (* ======================== 前端阶段 ======================== *)
-    
-    (* 2. 词法和语法分析 *)
-    print_endline "1. [前端] 正在进行词法和语法分析...";
+    (* --- 前端 --- *)
     let ast = Parser.program Lexer.token lexbuf in
-    print_endline "   -> 分析成功, AST 已生成。";
-
-    (* 3. 语义分析 *)
-    print_endline "2. [前端] 正在进行语义分析...";
     Semantic.check_program ast;
-    print_endline "   -> 语义分析通过, 程序符合 ToyC 规范。";
 
-    (* ======================== 后端阶段 ======================== *)
-    
-    (* 4. 中间代码生成 (IR) *)
-    print_endline "3. [后端] 正在从 AST 生成中间代码 (IR)...";
+    (* --- 后端 --- *)
     let ir = Ir_gen.generate_ir ast in
-    print_endline "   -> IR 生成完毕。";
+
+    (* 如果开启了优化，可以在这里插入优化 pass *)
+    let final_ir =
+      if !optimize_enabled then (
+        Printf.eprintf "(-opt 标志被识别，但优化未实现)\n"; (* 向 stderr 打印提示信息 *)
+        ir
+      ) else (
+        ir
+      )
+    in
+
+    let assembly_code = Codegen.generate_from_ir final_ir in
     
-    (*
-       在这里可以插入一个可选的优化阶段:
-       print_endline "4. [后端] 正在优化 IR...";
-       let optimized_ir = Optimize.run ir in
-       print_endline "   -> IR 优化完成。";
-    *)
+    (* --- 写入输出 --- *)
+    Printf.fprintf out_channel "%s" assembly_code;
+    flush out_channel; (* 确保内容被立即写入，特别是对于 stdout *)
 
-    (* 5. 目标代码生成 (RISC-V) *)
-    print_endline "4. [后端] 正在从 IR 生成 RISC-V 汇编代码...";
-    let assembly_code = Codegen.generate_from_ir ir in (* 调用我们新加的模块 *)
-    print_endline "   -> 汇编代码已生成。";
-
-
-    (* 6. 写入输出文件 *)
-    let out_channel = open_out !output_file in
-    Printf.fprintf out_channel "%s\n" assembly_code; (* 在文件末尾加个换行符 *)
-    close_out out_channel;
-    
-    print_endline ("\n编译成功! 输出文件已保存至: " ^ !output_file);
-
-    (* 清理工作 *)
-    close_in in_channel
+    (* --- 清理工作 --- *)
+    close_in_channel ();
+    close_out_channel ()
 
   with
-  (* 捕获并处理各个阶段的错误 *)
+  (* 错误处理部分保持不变，但要确保在退出前关闭文件 *)
   | Lexer.LexerError msg ->
-      Printf.eprintf "\n[错误] 词法错误在 %s: %s\n" (string_of_position lexbuf.lex_curr_p) msg;
-      close_in_noerr in_channel;
+      Printf.eprintf "[错误] 词法错误在 %s: %s\n" (string_of_position lexbuf.lex_curr_p) msg;
+      close_in_channel (); close_out_channel ();
       exit 1
   | Semantic.SemanticError msg ->
-      Printf.eprintf "\n[错误] 语义错误: %s\n" msg;
-      close_in_noerr in_channel;
+      Printf.eprintf "[错误] 语义错误: %s\n" msg;
+      close_in_channel (); close_out_channel ();
       exit 1
-  | Failure msg -> (* 捕获例如 break/continue 未实现的 'failwith' *)
-      Printf.eprintf "\n[内部错误] 编译中止: %s\n" msg;
-      close_in_noerr in_channel;
+  | Failure msg ->
+      Printf.eprintf "[内部错误] 编译中止: %s\n" msg;
+      close_in_channel (); close_out_channel ();
       exit 1
-  | e -> (* 捕获所有其他异常，包括私有的 Parser.Error *)
+  | e ->
       let pos_str = string_of_position lexbuf.lex_curr_p in
       (match Printexc.to_string e with
-       | "Parser.Error" -> (* ocamlyacc 抛出的异常的字符串形式就是 "Parser.Error" *)
-         Printf.eprintf "\n[错误] 语法错误在 %s 附近\n" pos_str
-       | _ -> (* 其他未知异常 *)
-         Printf.eprintf "\n[严重错误] 发生未知异常: %s (在 %s 附近)\n" (Printexc.to_string e) pos_str
+       | "Parser.Error" ->
+         Printf.eprintf "[错误] 语法错误在 %s 附近\n" pos_str
+       | _ ->
+         Printf.eprintf "[严重错误] 发生未知异常: %s (在 %s 附近)\n" (Printexc.to_string e) pos_str
       );
-      close_in_noerr in_channel;
+      close_in_channel (); close_out_channel ();
       exit 1
 
 
@@ -102,22 +125,6 @@ let compile () =
 let () =
   (* 解析命令行参数 *)
   Arg.parse speclist anon_fun usage_msg;
-
-  (* 检查是否提供了输入文件 *)
-  if !input_file = "" then (
-    Printf.eprintf "错误: 未指定输入源文件。\n%s\n" usage_msg;
-    exit 1
-  );
-
-  (* 如果用户未指定输出文件名, 根据输入文件名自动生成 *)
-  if !output_file = "" then (
-    try
-      (* Filename.chop_suffix 在 OCaml 4.04+ 中可用 *)
-      output_file := (Filename.chop_suffix !input_file ".tc") ^ ".s"
-    with Invalid_argument _ ->
-      (* 如果输入文件不以 .tc 结尾, 则简单地附加 .s *)
-      output_file := !input_file ^ ".s"
-  );
   
   (* 开始编译流程 *)
   compile ()
