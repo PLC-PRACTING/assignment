@@ -217,18 +217,23 @@ and translate_stmt (env: env) (stmt: Ast.stmt) : env * instruction list =
        let (instrs, opnd) = translate_expr env e in
        (env, instrs @ [Assign (unique_name, opnd)]))
   
-  | Block stmts ->
-    (* 1. 进入新作用域 *)
-    let inner_env = enter_scope env in
-    (* 2. 递归地处理块内语句，并传递更新后的环境 *)
-    let final_env, block_instrs = List.fold_left
-      (fun (e, instrs_acc) s ->
-        let (e', new_instrs) = translate_stmt e s in
-        (e', instrs_acc @ new_instrs)
-      ) (inner_env, []) stmts
-    in
-    (* 3. 退出作用域，并包裹上标记 *)
-    (exit_scope final_env, [ScopeBegin] @ block_instrs @ [ScopeEnd])
+  (* in translate_stmt *)
+| Block stmts ->
+  let inner_env = enter_scope env in
+  
+  (* 使用高效的列表构建方法 *)
+  let final_env, rev_instrs_list = List.fold_left
+    (fun (e, rev_acc) s ->
+      let (e', new_instrs) = translate_stmt e s in
+      (* 使用 :: (cons) 操作符，高效地将新指令列表添加到头部 *)
+      (e', new_instrs :: rev_acc)
+    ) (inner_env, []) stmts
+  in
+
+  (* 1. 反转列表顺序，2. 拍平列表的列表 *)
+  let block_instrs = List.concat (List.rev rev_instrs_list) in
+
+  (exit_scope final_env, [ScopeBegin] @ block_instrs @ [ScopeEnd])
 
   | If (cond, then_s, else_s_opt) ->
     let l_then = new_label env in
